@@ -609,10 +609,9 @@ static inline SkScalar sqr(SkScalar x) {
 
 static void ComputeComplexity(const SkPath& path, SkScalar& avgLength, SkScalar& complexity) {
     int n = path.countPoints();
-    if (n < kSampleSize) {
+    if (n < kSampleSize || path.getBounds().isEmpty()) {
         // set to invalid value to indicate that we failed to compute
-        avgLength = -1;
-        complexity = -1;
+        avgLength = complexity = -1;
         return;
     }
 
@@ -629,10 +628,14 @@ static void ComputeComplexity(const SkPath& path, SkScalar& avgLength, SkScalar&
 
     // If the path consists of random line segments, the number of intersections should be
     // proportional to this.
-    SkScalar intersections = sqr(n) * sqr(avgLength) / diagonalSqr;
+    SkScalar intersections = sk_ieee_float_divide(sqr(n) * sqr(avgLength), diagonalSqr);
 
     // The number of intersections per scanline should be proportional to this number.
-    complexity = intersections / path.getBounds().height();
+    complexity = sk_ieee_float_divide(intersections, path.getBounds().height());
+
+    if (sk_float_isnan(complexity)) {  // it may be possible to have 0.0 / 0.0; inf is fine for us.
+        complexity = -1;
+    }
 }
 
 static bool ShouldUseDAA(const SkPath& path, SkScalar avgLength, SkScalar complexity) {
@@ -694,6 +697,12 @@ static bool ShouldUseAAA(const SkPath& path, SkScalar avgLength, SkScalar comple
     // AA might be slower than supersampling.
     return path.countPoints() < SkTMax(bounds.width(), bounds.height()) / 2 - 10;
 #else
+    if (path.countPoints() >= path.getBounds().height()) {
+        // SAA is faster than AAA in this case even if there are no intersections because AAA will
+        // have too many scan lines. See skbug.com/8272
+        return false;
+    }
+
     // We will use AAA if the number of verbs < kSampleSize and therefore complexity < 0
     return complexity < kComplexityThreshold;
 #endif

@@ -134,10 +134,11 @@ static void draw_texture(const SkPaint& paint, const SkMatrix& ctm, const SkRect
         color = paintColorXform ? SkColorToUnpremulGrColor(paint.getColor())
                                 : SkColorToPremulGrColor(paint.getColor());
     } else {
-        color = SkColorAlphaToGrColor(paint.getColor());
+        color = GrColorPackA4(paint.getAlpha());
     }
-    rtc->drawTexture(clip, std::move(proxy), filter, color, srcRect, dstRect, aa, constraint, ctm,
-                     std::move(textureXform), std::move(paintColorXform));
+    GrQuadAAFlags aaFlags = aa == GrAA::kYes ? GrQuadAAFlags::kAll : GrQuadAAFlags::kNone;
+    rtc->drawTexture(clip, std::move(proxy), filter, color, srcRect, dstRect, aaFlags, constraint,
+                     ctm, std::move(textureXform), std::move(paintColorXform));
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -321,26 +322,8 @@ void SkGpuDevice::drawTextureProducerImpl(GrTextureProducer* producer,
         return;
     }
 
-    // First see if we can do the draw + mask filter direct to the dst.
-    if (viewMatrix.isScaleTranslate()) {
-        SkRect devClippedDstRect;
-        viewMatrix.mapRectScaleTranslate(&devClippedDstRect, clippedDstRect);
-
-        SkStrokeRec rec(SkStrokeRec::kFill_InitStyle);
-        if (as_MFB(mf)->directFilterRRectMaskGPU(fContext.get(),
-                                                 fRenderTargetContext.get(),
-                                                 std::move(grPaint),
-                                                 this->clip(),
-                                                 viewMatrix,
-                                                 rec,
-                                                 SkRRect::MakeRect(clippedDstRect),
-                                                 SkRRect::MakeRect(devClippedDstRect))) {
-            return;
-        }
-    }
-
     GrShape shape(clippedDstRect, GrStyle::SimpleFill());
 
     GrBlurUtils::drawShapeWithMaskFilter(this->context(), fRenderTargetContext.get(), this->clip(),
-                                         shape, std::move(grPaint), aa, viewMatrix, mf);
+                                         shape, std::move(grPaint), viewMatrix, mf);
 }

@@ -9,7 +9,6 @@
 #include "SkCodec.h"
 #include "SkCodecPriv.h"
 #include "SkColorSpace.h"
-#include "SkColorSpaceXformPriv.h"
 #include "SkData.h"
 #include "SkFrameHolder.h"
 #include "SkGifCodec.h"
@@ -126,26 +125,9 @@ std::unique_ptr<SkCodec> SkCodec::MakeFromData(sk_sp<SkData> data, SkPngChunkRea
     return MakeFromStream(SkMemoryStream::Make(std::move(data)), nullptr, reader);
 }
 
-SkCodec::SkCodec(int width, int height, const SkEncodedInfo& info,
-        XformFormat srcFormat, std::unique_ptr<SkStream> stream,
-        sk_sp<SkColorSpace> colorSpace, SkEncodedOrigin origin)
-    : fEncodedInfo(info)
-    , fSrcInfo(info.makeImageInfo(width, height, std::move(colorSpace)))
-    , fSrcXformFormat(srcFormat)
-    , fStream(std::move(stream))
-    , fNeedsRewind(false)
-    , fOrigin(origin)
-    , fDstInfo()
-    , fOptions()
-    , fCurrScanline(-1)
-    , fStartedIncrementalDecode(false)
-{}
-
-SkCodec::SkCodec(const SkEncodedInfo& info, const SkImageInfo& imageInfo,
-        XformFormat srcFormat, std::unique_ptr<SkStream> stream,
-        SkEncodedOrigin origin)
-    : fEncodedInfo(info)
-    , fSrcInfo(imageInfo)
+SkCodec::SkCodec(SkEncodedInfo&& info, XformFormat srcFormat, std::unique_ptr<SkStream> stream,
+                 SkEncodedOrigin origin)
+    : fEncodedInfo(std::move(info))
     , fSrcXformFormat(srcFormat)
     , fStream(std::move(stream))
     , fNeedsRewind(false)
@@ -158,8 +140,7 @@ SkCodec::SkCodec(const SkEncodedInfo& info, const SkImageInfo& imageInfo,
 
 SkCodec::~SkCodec() {}
 
-bool SkCodec::conversionSupported(const SkImageInfo& dst, SkColorType srcColor,
-                                  bool srcIsOpaque, const SkColorSpace* srcCS) const {
+bool SkCodec::conversionSupported(const SkImageInfo& dst, bool srcIsOpaque, bool needsColorXform) {
     if (!valid_alpha(dst.alphaType(), srcIsOpaque)) {
         return false;
     }
@@ -173,16 +154,14 @@ bool SkCodec::conversionSupported(const SkImageInfo& dst, SkColorType srcColor,
         case kRGB_565_SkColorType:
             return srcIsOpaque;
         case kGray_8_SkColorType:
-            return kGray_8_SkColorType == srcColor && srcIsOpaque &&
-                   !needs_color_xform(dst, srcCS);
+            return SkEncodedInfo::kGray_Color == fEncodedInfo.color() && srcIsOpaque;
         case kAlpha_8_SkColorType:
             // conceptually we can convert anything into alpha_8, but we haven't actually coded
-            // all of those other conversions yet, so only return true for the case we have codec.
-            return fSrcInfo.colorType() == kAlpha_8_SkColorType;;
+            // all of those other conversions yet.
+            return SkEncodedInfo::kXAlpha_Color == fEncodedInfo.color();
         default:
             return false;
     }
-
 }
 
 bool SkCodec::rewindIfNeeded() {
@@ -245,13 +224,8 @@ SkCodec::Result SkCodec::handleFrameIndex(const SkImageInfo& info, void* pixels,
                                           const Options& options) {
     const int index = options.fFrameIndex;
     if (0 == index) {
-        if (!this->conversionSupported(info, fSrcInfo.colorType(), fEncodedInfo.opaque(),
-                                      fSrcInfo.colorSpace())
-            || !this->initializeColorXform(info, fEncodedInfo.alpha()))
-        {
-            return kInvalidConversion;
-        }
-        return kSuccess;
+        return this->initializeColorXform(info, fEncodedInfo.alpha(), fEncodedInfo.opaque())
+            ? kSuccess : kInvalidConversion;
     }
 
     if (index < 0) {
@@ -274,11 +248,6 @@ SkCodec::Result SkCodec::handleFrameIndex(const SkImageInfo& info, void* pixels,
     const auto* frame = frameHolder->getFrame(index);
     SkASSERT(frame);
 
-    if (!this->conversionSupported(info, fSrcInfo.colorType(), !frame->hasAlpha(),
-                                   fSrcInfo.colorSpace())) {
-        return kInvalidConversion;
-    }
-
     const int requiredFrame = frame->getRequiredFrame();
     if (requiredFrame != kNoFrame) {
         if (options.fPriorFrame != kNoFrame) {
@@ -297,7 +266,7 @@ SkCodec::Result SkCodec::handleFrameIndex(const SkImageInfo& info, void* pixels,
                     // need to clear, since it must be covered by the desired frame.
                     if (options.fPriorFrame == requiredFrame) {
                         SkIRect prevRect = prevFrame->frameRect();
-                        if (!zero_rect(info, pixels, rowBytes, fSrcInfo.dimensions(), prevRect)) {
+                        if (!zero_rect(info, pixels, rowBytes, this->dimensions(), prevRect)) {
                             return kInternalError;
                         }
                     }
@@ -317,18 +286,24 @@ SkCodec::Result SkCodec::handleFrameIndex(const SkImageInfo& info, void* pixels,
             const auto disposalMethod = prevFrame->getDisposalMethod();
             if (disposalMethod == SkCodecAnimation::DisposalMethod::kRestoreBGColor) {
                 auto prevRect = prevFrame->frameRect();
-                if (!zero_rect(info, pixels, rowBytes, fSrcInfo.dimensions(), prevRect)) {
+                if (!zero_rect(info, pixels, rowBytes, this->dimensions(), prevRect)) {
                     return kInternalError;
                 }
             }
         }
     }
 
-    return this->initializeColorXform(info, frame->reportedAlpha()) ? kSuccess : kInvalidConversion;
+    return this->initializeColorXform(info, frame->reportedAlpha(), !frame->hasAlpha())
+        ? kSuccess : kInvalidConversion;
 }
 
-SkCodec::Result SkCodec::getPixels(const SkImageInfo& info, void* pixels, size_t rowBytes,
+SkCodec::Result SkCodec::getPixels(const SkImageInfo& dstInfo, void* pixels, size_t rowBytes,
                                    const Options* options) {
+    SkImageInfo info = dstInfo;
+    if (!info.colorSpace()) {
+        info = info.makeColorSpace(SkColorSpace::MakeSRGB());
+    }
+
     if (kUnknown_SkColorType == info.colorType()) {
         return kInvalidConversion;
     }
@@ -397,10 +372,14 @@ SkCodec::Result SkCodec::getPixels(const SkImageInfo& info, void* pixels, size_t
     return result;
 }
 
-SkCodec::Result SkCodec::startIncrementalDecode(const SkImageInfo& info, void* pixels,
+SkCodec::Result SkCodec::startIncrementalDecode(const SkImageInfo& dstInfo, void* pixels,
         size_t rowBytes, const SkCodec::Options* options) {
     fStartedIncrementalDecode = false;
 
+    SkImageInfo info = dstInfo;
+    if (!info.colorSpace()) {
+        info = info.makeColorSpace(SkColorSpace::MakeSRGB());
+    }
     if (kUnknown_SkColorType == info.colorType()) {
         return kInvalidConversion;
     }
@@ -466,10 +445,15 @@ SkCodec::Result SkCodec::startIncrementalDecode(const SkImageInfo& info, void* p
 }
 
 
-SkCodec::Result SkCodec::startScanlineDecode(const SkImageInfo& info,
+SkCodec::Result SkCodec::startScanlineDecode(const SkImageInfo& dstInfo,
         const SkCodec::Options* options) {
     // Reset fCurrScanline in case of failure.
     fCurrScanline = -1;
+
+    SkImageInfo info = dstInfo;
+    if (!info.colorSpace()) {
+        info = info.makeColorSpace(SkColorSpace::MakeSRGB());
+    }
 
     if (!this->rewindIfNeeded()) {
         return kCouldNotRewind;
@@ -558,7 +542,7 @@ bool SkCodec::skipScanlines(int countLines) {
 }
 
 int SkCodec::outputScanline(int inputScanline) const {
-    SkASSERT(0 <= inputScanline && inputScanline < this->getInfo().height());
+    SkASSERT(0 <= inputScanline && inputScanline < fEncodedInfo.height());
     return this->onOutputScanline(inputScanline);
 }
 
@@ -567,7 +551,7 @@ int SkCodec::onOutputScanline(int inputScanline) const {
         case kTopDown_SkScanlineOrder:
             return inputScanline;
         case kBottomUp_SkScanlineOrder:
-            return this->getInfo().height() - inputScanline - 1;
+            return fEncodedInfo.height() - inputScanline - 1;
         default:
             // This case indicates an interlaced gif and is implemented by SkGifCodec.
             SkASSERT(false);
@@ -612,63 +596,87 @@ void SkCodec::fillIncompleteImage(const SkImageInfo& info, void* dst, size_t row
     }
 }
 
-static inline SkColorSpaceXform::ColorFormat select_xform_format_ct(SkColorType colorType) {
+static inline bool select_xform_format(SkColorType colorType, bool forColorTable,
+                                       skcms_PixelFormat* outFormat) {
+    SkASSERT(outFormat);
+
     switch (colorType) {
         case kRGBA_8888_SkColorType:
-            return SkColorSpaceXform::kRGBA_8888_ColorFormat;
+            *outFormat = skcms_PixelFormat_RGBA_8888;
+            break;
         case kBGRA_8888_SkColorType:
-            return SkColorSpaceXform::kBGRA_8888_ColorFormat;
+            *outFormat = skcms_PixelFormat_BGRA_8888;
+            break;
         case kRGB_565_SkColorType:
+            if (forColorTable) {
 #ifdef SK_PMCOLOR_IS_RGBA
-            return SkColorSpaceXform::kRGBA_8888_ColorFormat;
+                *outFormat = skcms_PixelFormat_RGBA_8888;
 #else
-            return SkColorSpaceXform::kBGRA_8888_ColorFormat;
+                *outFormat = skcms_PixelFormat_BGRA_8888;
 #endif
+                break;
+            }
+            *outFormat = skcms_PixelFormat_BGR_565;
+            break;
+        case kRGBA_F16_SkColorType:
+            *outFormat = skcms_PixelFormat_RGBA_hhhh;
+            break;
+        case kGray_8_SkColorType:
+            *outFormat = skcms_PixelFormat_G_8;
+            break;
         default:
-            SkASSERT(false);
-            return SkColorSpaceXform::kRGBA_8888_ColorFormat;
-    }
-}
-
-bool SkCodec::initializeColorXform(const SkImageInfo& dstInfo, SkEncodedInfo::Alpha encodedAlpha) {
-    fColorXform = nullptr;
-    fXformOnDecode = false;
-    if (!this->usesColorXform()) {
-        return true;
-    }
-    // FIXME: In SkWebpCodec, if a frame is blending with a prior frame, we don't need
-    // a colorXform to do a color correct premul, since the blend step will handle
-    // premultiplication. But there is no way to know whether we need to blend from
-    // inside this call.
-    if (needs_color_xform(dstInfo, fSrcInfo.colorSpace())) {
-        fColorXform = SkMakeColorSpaceXform(fSrcInfo.colorSpace(), dstInfo.colorSpace());
-        if (!fColorXform) {
             return false;
-        }
-
-        // We will apply the color xform when reading the color table unless F16 is requested.
-        fXformOnDecode = SkEncodedInfo::kPalette_Color != fEncodedInfo.color()
-            || kRGBA_F16_SkColorType == dstInfo.colorType();
-        if (fXformOnDecode) {
-            fDstXformFormat = select_xform_format(dstInfo.colorType());
-        } else {
-            fDstXformFormat = select_xform_format_ct(dstInfo.colorType());
-        }
     }
-
     return true;
 }
 
-void SkCodec::applyColorXform(void* dst, const void* src, int count, SkAlphaType at) const {
-    SkASSERT(fColorXform);
-    SkAssertResult(fColorXform->apply(fDstXformFormat, dst,
-                                      fSrcXformFormat, src,
-                                      count, at));
+bool SkCodec::initializeColorXform(const SkImageInfo& dstInfo, SkEncodedInfo::Alpha encodedAlpha,
+                                   bool srcIsOpaque) {
+    fXformTime = kNo_XformTime;
+    bool needsColorXform = false;
+    if (this->usesColorXform() && dstInfo.colorSpace()) {
+        dstInfo.colorSpace()->toProfile(&fDstProfile);
+        if (kRGBA_F16_SkColorType == dstInfo.colorType()) {
+            needsColorXform = true;
+        } else {
+            const auto* srcProfile = fEncodedInfo.profile();
+            if (!srcProfile) {
+                srcProfile = skcms_sRGB_profile();
+            }
+            if (!skcms_ApproximatelyEqualProfiles(srcProfile, &fDstProfile) ) {
+                needsColorXform = true;
+            }
+        }
+    }
+
+    if (!this->conversionSupported(dstInfo, srcIsOpaque, needsColorXform)) {
+        return false;
+    }
+
+    if (needsColorXform) {
+        fXformTime = SkEncodedInfo::kPalette_Color != fEncodedInfo.color()
+                          || kRGBA_F16_SkColorType == dstInfo.colorType()
+                ? kDecodeRow_XformTime : kPalette_XformTime;
+        if (!select_xform_format(dstInfo.colorType(), fXformTime == kPalette_XformTime,
+                                 &fDstXformFormat)) {
+            return false;
+        }
+        if (encodedAlpha == SkEncodedInfo::kUnpremul_Alpha
+                && dstInfo.alphaType() == kPremul_SkAlphaType) {
+            fDstXformAlphaFormat = skcms_AlphaFormat_PremulAsEncoded;
+        } else {
+            fDstXformAlphaFormat = skcms_AlphaFormat_Unpremul;
+        }
+    }
+    return true;
 }
 
 void SkCodec::applyColorXform(void* dst, const void* src, int count) const {
-    auto alphaType = select_xform_alpha(fDstInfo.alphaType(), fSrcInfo.alphaType());
-    this->applyColorXform(dst, src, count, alphaType);
+    // It is okay for srcProfile to be null. This will use sRGB.
+    const auto* srcProfile = fEncodedInfo.profile();
+    SkAssertResult(skcms_Transform(src, fSrcXformFormat, skcms_AlphaFormat_Unpremul, srcProfile,
+                                   dst, fDstXformFormat, fDstXformAlphaFormat, &fDstProfile,
+                                   count));
 }
 
 std::vector<SkCodec::FrameInfo> SkCodec::getFrameInfo() {

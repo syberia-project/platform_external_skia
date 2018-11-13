@@ -7,8 +7,10 @@
 
 #include "SkottiePriv.h"
 
+#include "SkData.h"
 #include "SkFontMgr.h"
 #include "SkMakeUnique.h"
+#include "SkottieAdapter.h"
 #include "SkottieJson.h"
 #include "SkottieValue.h"
 #include "SkSGColor.h"
@@ -24,7 +26,7 @@ namespace internal {
 
 namespace {
 
-SkFontStyle FontStyle(const char* style) {
+SkFontStyle FontStyle(const AnimationBuilder* abuilder, const char* style) {
     static constexpr struct {
         const char*               fName;
         const SkFontStyle::Weight fWeight;
@@ -68,7 +70,7 @@ SkFontStyle FontStyle(const char* style) {
     }
 
     if (*style != '\0') {
-        LOG("?? Unknown font style: %s\n", style);
+        abuilder->log(Logger::Level::kWarning, nullptr, "Unknown font style: %s.", style);
     }
 
     return SkFontStyle(weight, SkFontStyle::kNormal_Width, slant);
@@ -91,6 +93,7 @@ void AnimationBuilder::parseFonts(const skjson::ObjectValue* jfonts,
     //                "fClass": "",
     //                "fFamily": "Roboto",
     //                "fName": "Roboto-Regular",
+    //                "fPath": "https://fonts.googleapis.com/css?family=Roboto",
     //                "fPath": "",
     //                "fStyle": "Regular",
     //                "fWeight": "",
@@ -108,21 +111,38 @@ void AnimationBuilder::parseFonts(const skjson::ObjectValue* jfonts,
                 const skjson::StringValue* jname   = (*jfont)["fName"];
                 const skjson::StringValue* jfamily = (*jfont)["fFamily"];
                 const skjson::StringValue* jstyle  = (*jfont)["fStyle"];
+                const skjson::StringValue* jpath   = (*jfont)["fPath"];
 
                 if (!jname   || !jname->size() ||
                     !jfamily || !jfamily->size() ||
                     !jstyle  || !jstyle->size()) {
-                    LogJSON(*jfont, "!! Ignoring invalid font");
+                    this->log(Logger::Level::kError, jfont, "Invalid font.");
                     continue;
                 }
 
-                sk_sp<SkTypeface> tf(fFontMgr->matchFamilyStyle(jfamily->begin(),
-                                                                FontStyle(jstyle->begin())));
+                const auto& fmgr = fLazyFontMgr.get();
+
+                // Typeface fallback order:
+                //   1) externally-loaded font (provided by the embedder)
+                //   2) system font (family/style)
+                //   3) system default
+
+                sk_sp<SkTypeface> tf =
+                    fmgr->makeFromData(fResourceProvider->loadFont(jname->begin(),
+                                                                   jpath ? jpath->begin()
+                                                                         : nullptr));
+
                 if (!tf) {
-                    LOG("!! Could not create typeface for %s|%s\n",
-                        jfamily->begin(), jstyle->begin());
+                    tf.reset(fmgr->matchFamilyStyle(jfamily->begin(),
+                                                    FontStyle(this, jstyle->begin())));
+                }
+
+                if (!tf) {
+                    this->log(Logger::Level::kError, nullptr,
+                              "Could not create typeface for %s|%s.",
+                              jfamily->begin(), jstyle->begin());
                     // Last resort.
-                    tf.reset(fFontMgr->matchFamilyStyle("Arial", SkFontStyle::Normal()));
+                    tf = fmgr->legacyMakeTypeface(nullptr, FontStyle(this, jstyle->begin()));
                     if (!tf) {
                         continue;
                     }
@@ -172,7 +192,7 @@ void AnimationBuilder::parseFonts(const skjson::ObjectValue* jfonts,
             const auto  ch_len = jch->size();
 
             if (!jfamily || !jstyle || (SkUTF::CountUTF8(ch_ptr, ch_len) != 1)) {
-                LogJSON(*jchar, "!! Invalid glyph");
+                this->log(Logger::Level::kError, jchar, "Invalid glyph.");
                 continue;
             }
 
@@ -195,7 +215,8 @@ void AnimationBuilder::parseFonts(const skjson::ObjectValue* jfonts,
                     }
                 });
                 if (!current_font) {
-                    LOG("!! Font not found for codepoint (%d, %s, %s)\n", uni, family, style);
+                    this->log(Logger::Level::kError, nullptr,
+                              "Font not found for codepoint (%d, %s, %s).", uni, family, style);
                     continue;
                 }
             }
@@ -205,8 +226,18 @@ void AnimationBuilder::parseFonts(const skjson::ObjectValue* jfonts,
     }
 }
 
+sk_sp<SkTypeface> AnimationBuilder::findFont(const SkString& font_name) const {
+    if (const auto* font = fFonts.find(font_name)) {
+        return font->fTypeface;
+    }
+
+    this->log(Logger::Level::kError, nullptr, "Unknown font: \"%s\".", font_name.c_str());
+    return nullptr;
+}
+
 sk_sp<sksg::RenderNode> AnimationBuilder::attachTextLayer(const skjson::ObjectValue& layer,
-                                                          AnimatorScope* ascope) {
+                                                          const LayerInfo&,
+                                                          AnimatorScope* ascope) const {
     // General text node format:
     // "t": {
     //    "a": [], // animators (TODO)
@@ -236,99 +267,28 @@ sk_sp<sksg::RenderNode> AnimationBuilder::attachTextLayer(const skjson::ObjectVa
     // },
     const skjson::ObjectValue* jt = layer["t"];
     if (!jt) {
-        LogJSON(layer, "!! Missing text layer \"t\" property");
+        this->log(Logger::Level::kError, &layer, "Missing text layer \"t\" property.");
         return nullptr;
     }
 
     const skjson::ArrayValue* animated_props = (*jt)["a"];
     if (animated_props && animated_props->size() > 0) {
-        LOG("?? Unsupported animated text properties.\n");
+        this->log(Logger::Level::kWarning, nullptr, "Unsupported animated text properties.");
     }
 
-    // TODO: The "d" node is keyframed, not static. Add a new animated value type and parse as such.
     const skjson::ObjectValue* jd  = (*jt)["d"];
-    const skjson::ArrayValue*  jk  = jd
-            ? (*jd)["k"].operator const skjson::ArrayValue*() : nullptr;
-    const skjson::ObjectValue* jv0 = jk && jk->size() == 1
-            ? (*jk)[0].operator const skjson::ObjectValue*() : nullptr;
-    const skjson::ObjectValue* jprops = jv0
-            ? (*jv0)["s"].operator const skjson::ObjectValue*() : nullptr;
-
-    if (!jprops) {
-        LogJSON(*jt, "!! Unexpected text property");
+    if (!jd) {
         return nullptr;
     }
 
-    const skjson::StringValue* font_name = (*jprops)["f"];
-    const skjson::StringValue* text      = (*jprops)["t"];
-    const skjson::NumberValue* text_size = (*jprops)["s"];
-    if (!font_name || !text || !text_size) {
-        LogJSON(*jprops, "!! Invalid text properties");
-        return nullptr;
-    }
+    auto text_root = sksg::Group::Make();
+    auto adapter   = sk_make_sp<TextAdapter>(text_root);
 
-    const auto* font = fFonts.find(SkString(font_name->begin(), font_name->size()));
-    if (!font) {
-        LOG("!! Unknown font: \"%s\"\n", font_name->begin());
-        return nullptr;
-    }
+    this->bindProperty<TextValue>(*jd, ascope, [adapter] (const TextValue& txt) {
+        adapter->setText(txt);
+    });
 
-    static constexpr SkPaint::Align gAlignMap[] = {
-        SkPaint::kLeft_Align,  // 'j': 0
-        SkPaint::kRight_Align, // 'j': 1
-        SkPaint::kCenter_Align // 'j': 2
-    };
-    const auto align = gAlignMap[SkTMin<size_t>(ParseDefault<size_t>((*jprops)["j"], 0),
-                                                SK_ARRAY_COUNT(gAlignMap))];
-
-    // Emit a SG fragment with the following general format:
-    //
-    // [Group]
-    //   [Draw]
-    //     [FillPaint]
-    //     [Text]
-    //   [Draw]
-    //     [StrokePaint]
-    //     [Text]
-    //
-    auto text_node = sksg::Text::Make(font->fTypeface, SkString(text->begin(), text->size()));
-    text_node->setSize(**text_size);
-    text_node->setAlign(align);
-
-    const auto parse_color = [](const skjson::ArrayValue* jcolor) -> sk_sp<sksg::Color> {
-        VectorValue color_vec;
-        if (!jcolor || !Parse(*jcolor, &color_vec)) {
-            return nullptr;
-        }
-
-        auto paint = sksg::Color::Make(ValueTraits<VectorValue>::As<SkColor>(color_vec));
-        paint->setAntiAlias(true);
-
-        return paint;
-    };
-
-    auto fill_paint = parse_color((*jprops)["fc"]),
-       stroke_paint = parse_color((*jprops)["sc"]);
-    auto  fill_node = sksg::Draw::Make(text_node, fill_paint),
-        stroke_node = sksg::Draw::Make(text_node, stroke_paint);
-
-    if (!stroke_node) {
-        return std::move(fill_node);
-    }
-
-    stroke_paint->setStyle(SkPaint::kStroke_Style);
-    stroke_paint->setStrokeWidth(ParseDefault((*jprops)["sw"], 0.0f));
-
-    if (!fill_node) {
-        return std::move(stroke_node);
-    }
-
-    // Fill & stroke
-    auto group_node = sksg::Group::Make();
-    group_node->addChild(std::move(fill_node));
-    group_node->addChild(std::move(stroke_node));
-
-    return std::move(group_node);
+    return std::move(text_root);
 }
 
 } // namespace internal

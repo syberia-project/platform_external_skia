@@ -13,7 +13,6 @@
 #include "../private/SkEncodedInfo.h"
 #include "SkCodecAnimation.h"
 #include "SkColor.h"
-#include "SkColorSpaceXform.h"
 #include "SkEncodedImageFormat.h"
 #include "SkEncodedOrigin.h"
 #include "SkImageInfo.h"
@@ -170,9 +169,14 @@ public:
     virtual ~SkCodec();
 
     /**
-     *  Return the ImageInfo associated with this codec.
+     *  Return a reasonable SkImageInfo to decode into.
      */
-    const SkImageInfo& getInfo() const { return fSrcInfo; }
+    SkImageInfo getInfo() const { return fEncodedInfo.makeImageInfo(); }
+
+    SkISize dimensions() const { return {fEncodedInfo.width(), fEncodedInfo.height()}; }
+    SkIRect bounds() const {
+        return SkIRect::MakeWH(fEncodedInfo.width(), fEncodedInfo.height());
+    }
 
     /**
      *  Returns the image orientation stored in the EXIF data.
@@ -197,7 +201,7 @@ public:
         // Upscaling is not supported. Return the original size if the client
         // requests an upscale.
         if (desiredScale >= 1.0f) {
-            return this->getInfo().dimensions();
+            return this->dimensions();
         }
         return this->onGetScaledDimensions(desiredScale);
     }
@@ -671,28 +675,16 @@ public:
 protected:
     const SkEncodedInfo& getEncodedInfo() const { return fEncodedInfo; }
 
-    using XformFormat = SkColorSpaceXform::ColorFormat;
+    using XformFormat = skcms_PixelFormat;
 
-    SkCodec(int width,
-            int height,
-            const SkEncodedInfo&,
-            XformFormat srcFormat,
-            std::unique_ptr<SkStream>,
-            sk_sp<SkColorSpace>,
-            SkEncodedOrigin = kTopLeft_SkEncodedOrigin);
-
-    /**
-     *  Allows the subclass to set the recommended SkImageInfo
-     */
-    SkCodec(const SkEncodedInfo&,
-            const SkImageInfo&,
+    SkCodec(SkEncodedInfo&&,
             XformFormat srcFormat,
             std::unique_ptr<SkStream>,
             SkEncodedOrigin = kTopLeft_SkEncodedOrigin);
 
     virtual SkISize onGetScaledDimensions(float /*desiredScale*/) const {
         // By default, scaling is not supported.
-        return this->getInfo().dimensions();
+        return this->dimensions();
     }
 
     // FIXME: What to do about subsets??
@@ -780,16 +772,14 @@ protected:
 
     virtual int onOutputScanline(int inputScanline) const;
 
-    bool initializeColorXform(const SkImageInfo& dstInfo, SkEncodedInfo::Alpha);
     // Some classes never need a colorXform e.g.
     // - ICO uses its embedded codec's colorXform
     // - WBMP is just Black/White
     virtual bool usesColorXform() const { return true; }
-    void applyColorXform(void* dst, const void* src, int count, SkAlphaType) const;
     void applyColorXform(void* dst, const void* src, int count) const;
 
-    SkColorSpaceXform* colorXform() const { return fColorXform.get(); }
-    bool xformOnDecode() const { return fXformOnDecode; }
+    bool colorXform() const { return fXformTime != kNo_XformTime; }
+    bool xformOnDecode() const { return fXformTime == kDecodeRow_XformTime; }
 
     virtual int onGetFrameCount() {
         return 1;
@@ -805,7 +795,6 @@ protected:
 
 private:
     const SkEncodedInfo                fEncodedInfo;
-    const SkImageInfo                  fSrcInfo;
     const XformFormat                  fSrcXformFormat;
     std::unique_ptr<SkStream>          fStream;
     bool                               fNeedsRewind;
@@ -813,9 +802,16 @@ private:
 
     SkImageInfo                        fDstInfo;
     Options                            fOptions;
+
+    enum XformTime {
+        kNo_XformTime,
+        kPalette_XformTime,
+        kDecodeRow_XformTime,
+    };
+    XformTime                          fXformTime;
     XformFormat                        fDstXformFormat; // Based on fDstInfo.
-    std::unique_ptr<SkColorSpaceXform> fColorXform;
-    bool                               fXformOnDecode;
+    skcms_ICCProfile                   fDstProfile;
+    skcms_AlphaFormat                  fDstXformAlphaFormat;
 
     // Only meaningful during scanline decodes.
     int                                fCurrScanline;
@@ -823,12 +819,15 @@ private:
     bool                               fStartedIncrementalDecode;
 
     /**
-     *  Return whether {srcColor, srcIsOpaque, srcCS} can convert to dst.
+     *  Return whether we can convert to dst.
      *
      *  Will be called for the appropriate frame, prior to initializing the colorXform.
      */
-    virtual bool conversionSupported(const SkImageInfo& dst, SkColorType srcColor,
-                                     bool srcIsOpaque, const SkColorSpace* srcCS) const;
+    virtual bool conversionSupported(const SkImageInfo& dst, bool srcIsOpaque,
+                                     bool needsColorXform);
+
+    bool initializeColorXform(const SkImageInfo& dstInfo, SkEncodedInfo::Alpha, bool srcIsOpaque);
+
     /**
      *  Return whether these dimensions are supported as a scale.
      *
@@ -839,7 +838,7 @@ private:
      *  This must return true for a size returned from getScaledDimensions.
      */
     bool dimensionsSupported(const SkISize& dim) {
-        return dim == fSrcInfo.dimensions() || this->onDimensionsSupported(dim);
+        return dim == this->dimensions() || this->onDimensionsSupported(dim);
     }
 
     /**

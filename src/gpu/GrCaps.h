@@ -58,6 +58,7 @@ public:
     bool multisampleDisableSupport() const { return fMultisampleDisableSupport; }
     bool instanceAttribSupport() const { return fInstanceAttribSupport; }
     bool usesMixedSamples() const { return fUsesMixedSamples; }
+    bool halfFloatVertexAttributeSupport() const { return fHalfFloatVertexAttributeSupport; }
 
     // Primitive restart functionality is core in ES 3.0, but using it will cause slowdowns on some
     // systems. This cap is only set if primitive restart will improve performance.
@@ -74,6 +75,8 @@ public:
     bool blacklistCoverageCounting() const { return fBlacklistCoverageCounting; }
 
     bool avoidStencilBuffers() const { return fAvoidStencilBuffers; }
+
+    bool avoidWritePixelsFastPath() const { return fAvoidWritePixelsFastPath; }
 
     /**
      * Indicates the capabilities of the fixed function blend unit.
@@ -228,6 +231,12 @@ public:
         is not initialized (even if not read by draw calls). */
     bool mustClearUploadedBufferData() const { return fMustClearUploadedBufferData; }
 
+    /** Returns true if the given backend supports importing AHardwareBuffers via the
+     * GrAHardwarebufferImageGenerator. This will only ever be supported on Android devices with API
+     * level >= 26.
+     * */
+    bool supportsAHardwareBufferImages() const { return fSupportsAHardwareBufferImages; }
+
     bool wireframeMode() const { return fWireframeMode; }
 
     bool sampleShadingSupport() const { return fSampleShadingSupport; }
@@ -318,10 +327,13 @@ protected:
     bool fPreferClientSideDynamicBuffers             : 1;
     bool fPreferFullscreenClears                     : 1;
     bool fMustClearUploadedBufferData                : 1;
+    bool fSupportsAHardwareBufferImages              : 1;
+    bool fHalfFloatVertexAttributeSupport            : 1;
 
     // Driver workaround
     bool fBlacklistCoverageCounting                  : 1;
     bool fAvoidStencilBuffers                        : 1;
+    bool fAvoidWritePixelsFastPath                   : 1;
 
     // ANGLE performance workaround
     bool fPreferVRAMUseOverFlushes                   : 1;

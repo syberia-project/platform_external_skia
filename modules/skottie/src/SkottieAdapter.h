@@ -15,12 +15,16 @@
 
 namespace sksg {
 
+class Color;
+class Draw;
 class Gradient;
+class Group;
 class LinearGradient;
 class Matrix;
 class Path;
 class RadialGradient;
 class RRect;
+class Text;
 class TrimEffect;
 
 };
@@ -28,6 +32,9 @@ class TrimEffect;
 namespace skottie {
 
 #define ADAPTER_PROPERTY(p_name, p_type, p_default) \
+    const p_type& get##p_name() const {             \
+        return f##p_name;                           \
+    }                                               \
     void set##p_name(const p_type& p) {             \
         if (p == f##p_name) return;                 \
         f##p_name = p;                              \
@@ -88,6 +95,8 @@ public:
     ADAPTER_PROPERTY(Rotation   , SkScalar, 0)
     ADAPTER_PROPERTY(Skew       , SkScalar, 0)
     ADAPTER_PROPERTY(SkewAxis   , SkScalar, 0)
+
+    SkMatrix totalMatrix() const;
 
 private:
     void apply();
@@ -152,6 +161,30 @@ private:
     void apply();
 
     sk_sp<sksg::TrimEffect> fTrimEffect;
+
+    using INHERITED = SkRefCnt;
+};
+
+class TextAdapter final : public SkRefCnt {
+public:
+    explicit TextAdapter(sk_sp<sksg::Group> root);
+
+    ADAPTER_PROPERTY(Text, TextValue, TextValue())
+
+    const sk_sp<sksg::Group>& root() const { return fRoot; }
+
+private:
+    void apply();
+
+    sk_sp<sksg::Group> fRoot;
+    sk_sp<sksg::Text>  fTextNode;
+    sk_sp<sksg::Color> fFillColor,
+                       fStrokeColor;
+    sk_sp<sksg::Draw>  fFillNode,
+                       fStrokeNode;
+
+    bool               fHadFill   : 1, //  - state cached from the prev apply()
+                       fHadStroke : 1; //  /
 
     using INHERITED = SkRefCnt;
 };

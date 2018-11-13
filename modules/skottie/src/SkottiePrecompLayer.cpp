@@ -8,7 +8,6 @@
 #include "SkottiePriv.h"
 
 #include "SkJSON.h"
-#include "SkottieAnimator.h"
 #include "SkottieJson.h"
 #include "SkottieValue.h"
 #include "SkMakeUnique.h"
@@ -20,10 +19,12 @@ namespace skottie {
 namespace internal {
 
 sk_sp<sksg::RenderNode> AnimationBuilder::attachPrecompLayer(const skjson::ObjectValue& jlayer,
-                                                             AnimatorScope* ascope) {
+                                                             const LayerInfo&,
+                                                             AnimatorScope* ascope) const {
     const skjson::ObjectValue* time_remap = jlayer["tm"];
-    const auto start_time = ParseDefault<float>(jlayer["st"], 0.0f),
-             stretch_time = ParseDefault<float>(jlayer["sr"], 1.0f);
+    // Empirically, a time mapper supersedes start/stretch.
+    const auto start_time = time_remap ? 0.0f : ParseDefault<float>(jlayer["st"], 0.0f),
+             stretch_time = time_remap ? 1.0f : ParseDefault<float>(jlayer["sr"], 1.0f);
     const auto requires_time_mapping = !SkScalarNearlyEqual(start_time  , 0) ||
                                        !SkScalarNearlyEqual(stretch_time, 1) ||
                                        time_remap;
@@ -31,7 +32,10 @@ sk_sp<sksg::RenderNode> AnimationBuilder::attachPrecompLayer(const skjson::Objec
     AnimatorScope local_animators;
     auto precomp_layer = this->attachAssetRef(jlayer,
                                               requires_time_mapping ? &local_animators : ascope,
-                                              &AnimationBuilder::attachComposition);
+                                              [this] (const skjson::ObjectValue& jcomp,
+                                                      AnimatorScope* ascope) {
+                                                  return this->attachComposition(jcomp, ascope);
+                                              });
 
     // Applies a bias/scale/remap t-adjustment to child animators.
     class CompTimeMapper final : public sksg::GroupAnimator {
@@ -63,14 +67,15 @@ sk_sp<sksg::RenderNode> AnimationBuilder::attachPrecompLayer(const skjson::Objec
     if (requires_time_mapping) {
         const auto t_bias  = -start_time,
                    t_scale = sk_ieee_float_divide(1, stretch_time);
-        auto time_mapper = skstd::make_unique<CompTimeMapper>(std::move(local_animators),
-                                                              t_bias, t_scale);
+        auto time_mapper =
+            skstd::make_unique<CompTimeMapper>(std::move(local_animators), t_bias,
+                                               sk_float_isfinite(t_scale) ? t_scale : 0);
         if (time_remap) {
             // The lambda below captures a raw pointer to the mapper object.  That should be safe,
             // because both the lambda and the mapper are scoped/owned by ctx->fAnimators.
             auto* raw_mapper = time_mapper.get();
             auto  frame_rate = fFrameRate;
-            BindProperty<ScalarValue>(*time_remap, ascope,
+            this->bindProperty<ScalarValue>(*time_remap, ascope,
                     [raw_mapper, frame_rate](const ScalarValue& t) {
                         raw_mapper->remapTime(t * frame_rate);
                     });

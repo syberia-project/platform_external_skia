@@ -118,7 +118,7 @@ public:
     void clearStencilClip(const GrFixedClip&, bool insideStencilMask,
                           GrRenderTarget*, GrSurfaceOrigin);
 
-    void clearStencil(GrRenderTarget*, int clearValue) override;
+    void clearStencil(GrRenderTarget*, int clearValue);
 
     GrGpuRTCommandBuffer* getCommandBuffer(
             GrRenderTarget*, GrSurfaceOrigin,
@@ -136,8 +136,9 @@ public:
                                                                 int height) override;
 #if GR_TEST_UTILS
     GrBackendTexture createTestingOnlyBackendTexture(const void* pixels, int w, int h,
-                                                     GrPixelConfig config, bool isRenderTarget,
-                                                     GrMipMapped mipMapped) override;
+                                                     GrColorType colorType, bool isRenderTarget,
+                                                     GrMipMapped mipMapped,
+                                                     size_t rowBytes = 0) override;
     bool isTestingOnlyBackendTexture(const GrBackendTexture&) const override;
     void deleteTestingOnlyBackendTexture(const GrBackendTexture&) override;
 
@@ -403,7 +404,9 @@ private:
     // Must be called if bindSurfaceFBOForPixelOps was used to bind a surface for copying.
     void unbindTextureFBOForPixelOps(GrGLenum fboTarget, GrSurface* surface);
 
+#ifdef SK_ENABLE_DUMP_GPU
     void onDumpJSON(SkJSONWriter*) const override;
+#endif
 
     bool createCopyProgram(GrTexture* srcTexture);
     bool createMipmapProgram(int progIdx);
