@@ -910,7 +910,7 @@ cc_library_static {
                "skia_pgo",
     ],
 
-    quicksilver: true,
+    sdclang: false,
 }
 
 // Build libskia with PGO by default.
